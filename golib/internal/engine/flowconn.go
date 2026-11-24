@@ -6,7 +6,7 @@ import (
 	"net"
 	"sync"
 
-	"netmerge-android/internal/nics"
+	"netbond-android/internal/nics"
 )
 
 // slotConn counts a pinned TCP flow's bytes and releases its slot on Close. It exposes

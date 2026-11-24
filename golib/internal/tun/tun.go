@@ -21,7 +21,7 @@ import (
 	"github.com/xjasonlyu/tun2socks/v2/proxy/reject"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel"
 
-	"netmerge-android/internal/engine"
+	"netbond-android/internal/engine"
 )
 
 // udpSessionTimeout ends idle UDP sessions sooner than tun2socks' 60s (see upstream).

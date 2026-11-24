@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"netmerge-android/internal/nics"
+	"netbond-android/internal/nics"
 )
 
 func nic(name, ip string, w float64) nics.Nic {

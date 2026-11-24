@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"netmerge-android/internal/nics"
+	"netbond-android/internal/nics"
 )
 
 // Family selects which address of a NIC a flow is pinned to.

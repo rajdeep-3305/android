@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"netmerge-android/internal/nics"
+	"netbond-android/internal/nics"
 )
 
 // Internet reachability probes: a TCP connect to well-known anycast IPs bound to the NIC.

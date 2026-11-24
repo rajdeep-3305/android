@@ -1,4 +1,4 @@
-module netmerge-android
+module netbond-android
 
 go 1.27
 

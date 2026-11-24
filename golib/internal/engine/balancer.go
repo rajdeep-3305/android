@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"netmerge-android/internal/nics"
+	"netbond-android/internal/nics"
 )
 
 // Balancer dials outbound flows through the Scheduler. Front-ends (SOCKS5 now, TUN later)

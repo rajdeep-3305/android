@@ -1,4 +1,4 @@
-package netmerge
+package netbond
 
 import (
 	"encoding/json"
@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"netmerge-android/internal/engine"
-	"netmerge-android/internal/nics"
-	"netmerge-android/internal/tun"
+	"netbond-android/internal/engine"
+	"netbond-android/internal/nics"
+	"netbond-android/internal/tun"
 )
 
 // Modes matching Kotlin side:

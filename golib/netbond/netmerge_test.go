@@ -1,4 +1,4 @@
-package netmerge
+package netbond
 
 import (
 	"encoding/json"
