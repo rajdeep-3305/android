@@ -6,8 +6,8 @@ cd "$(dirname "$0")/../golib"
 # gomobile and gobind at the versions pinned in go.mod.
 GOBIN="$PWD/.bin" go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
 export PATH="$PWD/.bin:$PATH"
-targets="${GOMOBILE_TARGETS:-android/arm64,android/arm,android/amd64}"
+targets="${GOMOBILE_TARGETS:-android/arm64,android/arm}"
 mkdir -p ../app/libs
-gomobile bind -v -trimpath -ldflags="-s -w" \
+gomobile bind -v -trimpath -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" \
   -target="$targets" -androidapi 26 \
   -o ../app/libs/netmerge.aar ./netmerge
