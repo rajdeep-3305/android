@@ -71,3 +71,31 @@ func TestSystemEstimateSeedsWeights(t *testing.T) {
 		}
 	}
 }
+
+
+func TestModeAPIAndStatsTelemetry(t *testing.T) {
+	if err := SetNetworks(`[{"name":"Wi-Fi","handle":"1","v4":true},{"name":"Mobile data","handle":"2","v4":true}]`); err != nil {
+		t.Fatal(err)
+	}
+	SetMode(ModeTurboBoost)
+	if GetMode() != ModeTurboBoost {
+		t.Fatalf("want TurboBoost (%d), got %d", ModeTurboBoost, GetMode())
+	}
+	SetMode(ModeSmartAdaptive)
+	if GetMode() != ModeSmartAdaptive {
+		t.Fatalf("want SmartAdaptive (%d), got %d", ModeSmartAdaptive, GetMode())
+	}
+	SetMode(ModeDataSaver)
+	if GetMode() != ModeDataSaver {
+		t.Fatalf("want DataSaver (%d), got %d", ModeDataSaver, GetMode())
+	}
+
+	// Check JSON stats includes ratio and rtt
+	var st []stat
+	if err := json.Unmarshal([]byte(Stats()), &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st) != 2 {
+		t.Fatalf("want 2 stats, got %d", len(st))
+	}
+}

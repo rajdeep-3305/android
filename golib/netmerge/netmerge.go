@@ -1,6 +1,3 @@
-// Package netmerge is the gomobile-facing API of the Android port. The Kotlin side (VpnService)
-// owns the TUN, tracks the available networks and calls in here; everything about picking a
-// network for each flow lives in the engine copied from upstream net-merge.
 package netmerge
 
 import (
@@ -16,33 +13,42 @@ import (
 	"netmerge-android/internal/tun"
 )
 
-var (
-	mu      sync.Mutex
-	sched   = engine.NewScheduler(nil)
-	bal     = engine.NewBalancer(sched)
-	dev     tun.Tun
-	stop    chan struct{}
-	indexes = map[string]int{} // network name -> stable index
-	last    []nics.Nic         // last list given to the scheduler, to re-apply weights
-	lastJS  string             // last SetNetworks input, re-applied when the mode changes
-	auto    = true
+// Modes matching Kotlin side:
+// 0: Turbo Boost (Max Speed Proportional Bonding)
+// 1: Smart Adaptive (QoS / Latency Steering + Bulk Proportional)
+// 2: Data Saver (Wi-Fi Preferred, Failover to Mobile)
+// 3: Split Evenly (50/50 Round Robin)
+const (
+	ModeTurboBoost    = 0
+	ModeSmartAdaptive = 1
+	ModeDataSaver     = 2
+	ModeSplitEvenly   = 3
 )
 
-func init() { sched.SetAuto(true) }
+var (
+	mu          sync.Mutex
+	sched       = engine.NewScheduler(nil)
+	bal         = engine.NewBalancer(sched)
+	dev         tun.Tun
+	stop        chan struct{}
+	indexes     = map[string]int{} // network name -> stable index
+	last        []nics.Nic         // last list given to the scheduler, to re-apply weights
+	lastJS      string             // last SetNetworks input, re-applied when the mode changes
+	currentMode = ModeTurboBoost
+)
+
+func init() { sched.SetMode(engine.ModeTurboBoost) }
 
 // network is what Kotlin reports for each usable network.
 type network struct {
-	Name   string  `json:"name"`
-	Handle string  `json:"handle"` // Network#getNetworkHandle, as a decimal string (it is 64-bit)
-	V4     bool    `json:"v4"`
-	V6     bool    `json:"v6"`
-	Weight float64 `json:"weight"`
-	// The system's bandwidth estimate (NetworkCapabilities link bandwidth), kbit/s; 0 = unknown.
+	Name     string  `json:"name"`
+	Handle   string  `json:"handle"` // Network#getNetworkHandle, as a decimal string
+	V4       bool    `json:"v4"`
+	V6       bool    `json:"v6"`
+	Weight   float64 `json:"weight"`
 	DownKbps float64 `json:"downKbps"`
 }
 
-// SetNetworks replaces the set of networks flows may use. It may be called at any time, before
-// or after Start. The argument is a JSON array of {name, handle, v4, v6, weight}.
 func SetNetworks(js string) error {
 	var in []network
 	if err := json.Unmarshal([]byte(js), &in); err != nil {
@@ -68,15 +74,12 @@ func SetNetworks(js string) error {
 		nics.SetHandle(idx, h)
 		w := n.Weight
 		if w <= 0 {
-			w = 1
-			// With speed-based balancing, start from the system's estimate (relative to the fastest
-			// network, floored so a slow one is still tried and measured).
-			if auto && maxDown > 0 && n.DownKbps > 0 {
+			w = 1.0
+			if (currentMode == ModeTurboBoost || currentMode == ModeSmartAdaptive) && maxDown > 0 && n.DownKbps > 0 {
 				w = max(0.1, n.DownKbps/maxDown)
 			}
 		}
 		nic := nics.Nic{Name: n.Name, Index: idx, Weight: w}
-		// Unspecified source addresses: the Network binding chooses the real source.
 		if n.V4 {
 			nic.IP = net.IPv4zero
 		}
@@ -87,29 +90,37 @@ func SetNetworks(js string) error {
 	}
 	sched.Update(list)
 	last, lastJS = list, js
-	// Flows on a network that just went away would otherwise hang until they time out.
 	sched.CloseGone()
 	return nil
 }
 
-// SetAutoWeights picks how new connections are split. true (the default) follows each network's
-// measured speed; false splits them evenly, which helps when the networks' upload speeds are
-// closer than their download speeds.
-func SetAutoWeights(on bool) {
+func SetMode(mode int) {
 	mu.Lock()
-	auto = on
-	sched.SetAuto(on)
+	currentMode = mode
+	sched.SetMode(engine.Mode(mode))
 	js, list := lastJS, last
 	mu.Unlock()
 	if js != "" {
-		SetNetworks(js) // recompute the configured weights for the new mode
+		SetNetworks(js)
 	} else {
 		sched.Update(list)
 	}
 }
 
-// Start begins serving the VPN's TUN. fd must be a detached descriptor (ParcelFileDescriptor
-// #detachFd); the engine owns and closes it.
+func GetMode() int {
+	mu.Lock()
+	defer mu.Unlock()
+	return currentMode
+}
+
+func SetAutoWeights(on bool) {
+	if on {
+		SetMode(ModeTurboBoost)
+	} else {
+		SetMode(ModeSplitEvenly)
+	}
+}
+
 func Start(fd int, mtu int) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -127,7 +138,7 @@ func Start(fd int, mtu int) error {
 }
 
 func tick(stop <-chan struct{}) {
-	t := time.NewTicker(time.Second)
+	t := time.NewTicker(250 * time.Millisecond) // 4Hz silky smooth dynamic tracking
 	defer t.Stop()
 	last := time.Now()
 	for {
@@ -141,7 +152,6 @@ func tick(stop <-chan struct{}) {
 	}
 }
 
-// Stop tears the stack down and closes the TUN descriptor.
 func Stop() {
 	mu.Lock()
 	defer mu.Unlock()
@@ -152,14 +162,12 @@ func Stop() {
 	dev.Stop()
 }
 
-// IsRunning reports whether the engine is serving a TUN.
 func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return stop != nil
 }
 
-// SetIPv6Mode sets how IPv6 flows are handled: "auto", "on" or "off" (see upstream).
 func SetIPv6Mode(mode string) error {
 	m, ok := engine.ParseV6Mode(mode)
 	if !ok {
@@ -182,18 +190,34 @@ type stat struct {
 	RateOut  float64 `json:"rateOut"`
 	Weight   float64 `json:"weight"`
 	Present  bool    `json:"present"`
+	RTT      int64   `json:"rtt"`
+	Ratio    float64 `json:"ratio"`
 }
 
-// Stats returns a JSON array with one entry per network: probe state, flows and throughput.
 func Stats() string {
 	snap := sched.Snapshot()
+	var totalThroughput float64
+	for _, s := range snap {
+		if s.Present {
+			totalThroughput += s.RateIn + s.RateOut
+		}
+	}
 	out := make([]stat, 0, len(snap))
 	for _, s := range snap {
+		ratio := 0.0
+		if totalThroughput > 0 && s.Present {
+			ratio = ((s.RateIn + s.RateOut) / totalThroughput) * 100.0
+		}
+		rtt := s.RTT
+		if rtt <= 0 && s.RTT6 > 0 {
+			rtt = s.RTT6
+		}
 		out = append(out, stat{
 			Name: s.Name, State: s.State, State6: s.State6,
 			Active: s.Active, Total: s.Total, Failed: s.Failed,
 			BytesIn: s.BytesIn, BytesOut: s.BytesOut, RateIn: s.RateIn, RateOut: s.RateOut,
 			Weight: s.Weight, Present: s.Present,
+			RTT: rtt, Ratio: ratio,
 		})
 	}
 	b, _ := json.Marshal(out)

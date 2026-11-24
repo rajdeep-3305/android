@@ -89,7 +89,7 @@ func (b *Balancer) ListenUDP(ctx context.Context, f Family) (net.PacketConn, err
 	tried := map[string]struct{}{}
 	lastErr := errors.New("no usable network adapter")
 	for {
-		sl := b.S.AcquireFor(f, tried)
+		sl := b.S.AcquireForPort(f, 0, true, tried)
 		if sl == nil {
 			return nil, lastErr
 		}

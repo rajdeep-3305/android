@@ -364,3 +364,111 @@ func TestUploadWeightsFollowUplink(t *testing.T) {
 		t.Fatalf("upload: cell has the better uplink and should get more flows, ratio %.2f", r)
 	}
 }
+
+
+func TestModeSwitching(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("wifi", "10.0.0.1", 1), nic("cell", "10.0.0.2", 1)})
+	if s.Mode() != ModeTurboBoost {
+		t.Fatalf("default mode want TurboBoost, got %v", s.Mode())
+	}
+	s.SetMode(ModeDataSaver)
+	if s.Mode() != ModeDataSaver {
+		t.Fatalf("want DataSaver, got %v", s.Mode())
+	}
+	s.SetAuto(false)
+	if s.Mode() != ModeSplitEvenly {
+		t.Fatalf("SetAuto(false) want SplitEvenly, got %v", s.Mode())
+	}
+	s.SetAuto(true)
+	if s.Mode() != ModeTurboBoost {
+		t.Fatalf("SetAuto(true) want TurboBoost, got %v", s.Mode())
+	}
+}
+
+func TestTurboBoostProportionalBalancing(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("wifi", "10.0.0.1", 1), nic("cell", "10.0.0.2", 1)})
+	s.SetMode(ModeTurboBoost)
+	w, c := s.slots[0], s.slots[1]
+	const mbit = 125_000
+
+	// Simulate 14 Mbps on Wi-Fi, 65 Mbps on Cellular
+	for i := 0; i < 4; i++ {
+		w.bytesIn[Fam4].Add(int64(14 * mbit))
+		c.bytesIn[Fam4].Add(int64(65 * mbit))
+		s.Tick(time.Second)
+	}
+
+	// Ratio of cell weight to wifi weight should be ~ 65/14 = ~4.64
+	ratio := c.weight[Fam4] / w.weight[Fam4]
+	if ratio < 4.0 || ratio > 5.2 {
+		t.Fatalf("expected weight ratio ~4.64, got %.2f (w=%.3f, c=%.3f)", ratio, w.weight[Fam4], c.weight[Fam4])
+	}
+
+	// Acquire 20 flows
+	picks := acquireN(s, 22)
+	cellCount := countBy(picks, "cell")
+	wifiCount := countBy(picks, "wifi")
+
+	// Cellular should absorb roughly 18 flows and Wi-Fi roughly 4 flows
+	if cellCount < 16 || wifiCount < 3 {
+		t.Fatalf("proportional split failed: cell=%d, wifi=%d", cellCount, wifiCount)
+	}
+}
+
+func TestSmartAdaptiveSteersLowLatencyToLowestRTT(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("wifi", "10.0.0.1", 1), nic("cell", "10.0.0.2", 1)})
+	s.SetMode(ModeSmartAdaptive)
+	w, c := s.slots[0], s.slots[1]
+
+	s.SetStateWithRTT(w, Fam4, true, 8*time.Millisecond)   // Wi-Fi 8ms ping
+	s.SetStateWithRTT(c, Fam4, true, 45*time.Millisecond)  // Cell 45ms ping
+
+	// DNS queries (port 53) must steer to Wi-Fi (lowest RTT)
+	for i := 0; i < 10; i++ {
+		sl := s.AcquireForPort(Fam4, 53, false, nil)
+		if sl == nil || sl.Name != "wifi" {
+			t.Fatalf("DNS query %d went to %v, want wifi (lowest ping)", i, sl)
+		}
+		s.ReleaseFor(sl, Fam4)
+	}
+
+	// Gaming / VoIP UDP traffic must also steer to Wi-Fi
+	for i := 0; i < 10; i++ {
+		sl := s.AcquireForPort(Fam4, 0, true, nil)
+		if sl == nil || sl.Name != "wifi" {
+			t.Fatalf("UDP flow %d went to %v, want wifi (lowest ping)", i, sl)
+		}
+		s.ReleaseFor(sl, Fam4)
+	}
+}
+
+func TestDataSaverPrefersWifiAndFailover(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "10.0.0.1", 1), nic("Mobile data", "10.0.0.2", 1)})
+	s.SetMode(ModeDataSaver)
+	w, c := s.slots[0], s.slots[1]
+	s.SetState(w, Fam4, true)
+	s.SetState(c, Fam4, true)
+	s.Tick(time.Second)
+
+	// All flows should go to Wi-Fi to save cellular data
+	for i := 0; i < 10; i++ {
+		sl := s.Acquire(nil)
+		if sl == nil || sl.Name != "Wi-Fi" {
+			t.Fatalf("flow %d went to %v, want Wi-Fi in DataSaver", i, sl)
+		}
+		s.Release(sl)
+	}
+
+	// Wi-Fi drops / circuit breaker trips
+	s.SetState(w, Fam4, false)
+	s.Tick(time.Second)
+
+	// Instant failover to Cellular without outage
+	for i := 0; i < 5; i++ {
+		sl := s.Acquire(nil)
+		if sl == nil || sl.Name != "Mobile data" {
+			t.Fatalf("flow %d after failover went to %v, want Mobile data", i, sl)
+		}
+		s.Release(sl)
+	}
+}

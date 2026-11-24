@@ -7,22 +7,23 @@ import (
 	"netmerge-android/internal/nics"
 )
 
-// Internet reachability probes: a TCP connect to a well-known anycast IP, bound to the NIC.
+// Internet reachability probes: a TCP connect to well-known anycast IPs bound to the NIC.
+// Probing port 53 (DNS) and 443 (HTTPS) allows rapid SYN-ACK RTT tracking without TLS handshake.
 var probeTargets = [2][]string{
-	Fam4: {"1.1.1.1:443", "8.8.8.8:443"},
-	Fam6: {"[2606:4700:4700::1111]:443", "[2001:4860:4860::8888]:443"},
+	Fam4: {"1.1.1.1:53", "8.8.8.8:53", "1.1.1.1:443", "8.8.8.8:443"},
+	Fam6: {"[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:443", "[2001:4860:4860::8888]:443"},
 }
 
 const (
-	probeTimeout   = 2 * time.Second
-	probeEveryUp   = 15 * time.Second
-	probeEveryDown = 4 * time.Second
+	probeTimeout   = 1200 * time.Millisecond // fast circuit breaker detection
+	probeEveryUp   = 10 * time.Second
+	probeEveryDown = 2 * time.Second
 )
 
-func probe(sl *Slot, f Family) bool {
+func probeRTT(sl *Slot, f Family) (bool, time.Duration) {
 	ip := sl.ip(f)
 	if ip == nil {
-		return false
+		return false, 0
 	}
 	network := "tcp4"
 	if f == Fam6 {
@@ -30,12 +31,19 @@ func probe(sl *Slot, f Family) bool {
 	}
 	for _, t := range probeTargets[f] {
 		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}, Control: nics.ForceEgress(sl.Index, f == Fam6), Timeout: probeTimeout}
+		start := time.Now()
 		if c, err := d.Dial(network, t); err == nil {
+			rtt := time.Since(start)
 			c.Close()
-			return true
+			return true, rtt
 		}
 	}
-	return false
+	return false, 0
+}
+
+func probe(sl *Slot, f Family) bool {
+	ok, _ := probeRTT(sl, f)
+	return ok
 }
 
 type probeJob struct {
@@ -43,10 +51,7 @@ type probeJob struct {
 	f  Family
 }
 
-// RunProbes checks every adapter's internet access per address family: new ones immediately,
-// healthy ones occasionally, dead ones more often so they rejoin quickly. A tether with no data
-// or a captive-portal Wi-Fi therefore never receives flows, and a recovered link is used again
-// within seconds. Runs until stop is closed (nil = forever).
+// RunProbes checks every adapter's internet access per address family.
 func (s *Scheduler) RunProbes(stop <-chan struct{}) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -59,7 +64,8 @@ func (s *Scheduler) RunProbes(stop <-chan struct{}) {
 		for _, j := range s.probeDue() {
 			go func() {
 				defer j.sl.probing[j.f].Store(false)
-				s.SetState(j.sl, j.f, probe(j.sl, j.f))
+				up, rtt := probeRTT(j.sl, j.f)
+				s.SetStateWithRTT(j.sl, j.f, up, rtt)
 			}()
 		}
 	}
