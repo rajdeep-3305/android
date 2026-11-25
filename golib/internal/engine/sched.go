@@ -61,6 +61,7 @@ type Slot struct {
 	probing               [2]atomic.Bool
 
 	// guarded by Scheduler.mu
+	handle          uint64
 	weight          [2]float64
 	base            float64 // Android port: the configured weight, used until speeds are measured
 	present         bool
@@ -242,8 +243,8 @@ func normAddr(n nics.Nic) *slotAddr {
 }
 
 func (s *Scheduler) Update(nics []nics.Nic) {
+	var staleConns []io.Closer
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, sl := range s.slots {
 		sl.present = false
 	}
@@ -265,6 +266,7 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 				Name:    n.Name,
 				Index:   n.Index,
 				key:     n.Name,
+				handle:  n.Handle,
 				weight:  [2]float64{initWeight, initWeight},
 				base:    n.Weight,
 				present: true,
@@ -277,6 +279,22 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 		found.base = n.Weight
 		if s.mode == ModeSplitEvenly {
 			found.weight = [2]float64{1.0, 1.0}
+		}
+		if n.Handle != 0 && found.handle != 0 && found.handle != n.Handle {
+			found.handle = n.Handle
+			found.state = [2]linkState{stateUnknown, stateUnknown}
+			found.downUntil = [2]time.Time{}
+			found.rttMs[Fam4].Store(0)
+			found.rttMs[Fam6].Store(0)
+			found.udpDeficit = [2]float64{}
+			found.lastProbe = [2]time.Time{}
+			found.conns.Range(func(k, _ any) bool {
+				staleConns = append(staleConns, k.(io.Closer))
+				found.conns.Delete(k)
+				return true
+			})
+		} else if found.handle == 0 {
+			found.handle = n.Handle
 		}
 		old := found.addr.Load()
 		if old == nil || !old.ip4.Equal(na.ip4) {
@@ -297,6 +315,11 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 	}
 	s.slots = kept
 	s.applyModeWeightsLocked(false)
+	s.mu.Unlock()
+
+	for _, c := range staleConns {
+		_ = c.Close()
+	}
 }
 
 const minMeasuredPeak = 50_000 // bytes/s (0.4 Mbit/s)
@@ -708,8 +731,15 @@ func (s *Scheduler) SetState(sl *Slot, f Family, up bool) {
 }
 
 func (s *Scheduler) SetStateWithRTT(sl *Slot, f Family, up bool, rtt time.Duration) {
+	s.SetStateForHandle(sl, 0, f, up, rtt)
+}
+
+func (s *Scheduler) SetStateForHandle(sl *Slot, expectedHandle uint64, f Family, up bool, rtt time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if expectedHandle != 0 && sl.handle != expectedHandle {
+		return
+	}
 	if up {
 		sl.state[f] = stateUp
 		sl.downUntil[f] = time.Time{}

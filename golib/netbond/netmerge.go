@@ -72,7 +72,7 @@ func SetNetworks(js string) error {
 		if w <= 0 {
 			w = 1.0
 		}
-		nic := nics.Nic{Name: n.Name, Index: idx, Weight: w}
+		nic := nics.Nic{Name: n.Name, Index: idx, Handle: h, Weight: w}
 		if n.V4 {
 			nic.IP = net.IPv4zero
 		}
@@ -80,6 +80,15 @@ func SetNetworks(js string) error {
 			nic.IP6 = net.IPv6unspecified
 		}
 		list = append(list, nic)
+	}
+	activeIdx := make(map[int]struct{}, len(list))
+	for _, n := range list {
+		activeIdx[n.Index] = struct{}{}
+	}
+	for _, idx := range indexes {
+		if _, ok := activeIdx[idx]; !ok {
+			nics.DropHandle(idx)
+		}
 	}
 	sched.Update(list)
 	last, lastJS = list, js

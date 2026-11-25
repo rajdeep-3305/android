@@ -92,7 +92,7 @@ func (t *Tun) teardown() {
 		go func() { t.stk.Close(); t.stk.Wait(); close(done) }()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(1 * time.Second):
 		}
 	}
 	t.dev, t.stk = nil, nil

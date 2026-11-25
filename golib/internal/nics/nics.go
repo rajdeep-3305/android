@@ -15,7 +15,8 @@ import (
 // the IPv4 address lives on a stacked interface.
 type Nic struct {
 	Name   string
-	Index  int // id registered with SetHandle; 0 = don't pin (tests)
+	Index  int    // id registered with SetHandle; 0 = don't pin (tests)
+	Handle uint64 // Android Network#getNetworkHandle; 0 in tests
 	IP     net.IP
 	IP6    net.IP
 	Weight float64

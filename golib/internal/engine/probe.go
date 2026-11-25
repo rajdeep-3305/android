@@ -47,8 +47,9 @@ func probe(sl *Slot, f Family) bool {
 }
 
 type probeJob struct {
-	sl *Slot
-	f  Family
+	sl     *Slot
+	f      Family
+	handle uint64
 }
 
 // RunProbes checks every adapter's internet access per address family.
@@ -65,7 +66,7 @@ func (s *Scheduler) RunProbes(stop <-chan struct{}) {
 			go func() {
 				defer j.sl.probing[j.f].Store(false)
 				up, rtt := probeRTT(j.sl, j.f)
-				s.SetStateWithRTT(j.sl, j.f, up, rtt)
+				s.SetStateForHandle(j.sl, j.handle, j.f, up, rtt)
 			}()
 		}
 	}
@@ -95,7 +96,7 @@ func (s *Scheduler) probeDue() []probeJob {
 			if now.Sub(sl.lastProbe[f]) >= every {
 				sl.lastProbe[f] = now
 				sl.probing[f].Store(true)
-				due = append(due, probeJob{sl, f})
+				due = append(due, probeJob{sl: sl, f: f, handle: sl.handle})
 			}
 		}
 	}
