@@ -488,5 +488,47 @@ func TestHandleChangeResetsStateAndClosesStaleConns(t *testing.T) {
 	}
 }
 
+
+func Test100MB_TurboBoost_FastWifiSlowCell(t *testing.T) {
+	needLoopbackAliases(t)
+	host, port, stopSrv := startRateLimitedEchoServer(t, "127.0.0.2", "127.0.0.3", 120<<20, 20<<20)
+	defer stopSrv()
+
+	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "127.0.0.2", 1), nic("Mobile data", "127.0.0.3", 1)})
+	s.SetMode(ModeTurboBoost)
+	w, c := s.slots[0], s.slots[1]
+	s.SetStateWithRTT(w, Fam4, true, 6*time.Millisecond)
+	s.SetStateWithRTT(c, Fam4, true, 55*time.Millisecond)
+	// Simulate 5 idle background keep-alive sockets on Wi-Fi
+	for i := 0; i < 5; i++ {
+		w.active.Add(1)
+		w.actF[Fam4].Add(1)
+	}
+	b := NewBalancer(s)
+	stopTick := startTicker(s)
+	defer stopTick()
+
+	runDownloadBatch(t, b, host, port, 20<<20, 8)
+	runDownloadBatch(t, b, host, port, 80<<20, 16)
+
+	snap := s.Snapshot()
+	wifiIn, cellIn := snap[0].BytesIn, snap[1].BytesIn
+	t.Logf("TurboBoost Reverse 100MB (Fast Wi-Fi + Slow LTE): Wi-Fi=%d MB, Mobile=%d MB, active=%d/%d",
+		wifiIn>>20, cellIn>>20, snap[0].Active, snap[1].Active)
+	if wifiIn+cellIn < hundredMB {
+		t.Fatalf("expected >= %d bytesIn, got %d", hundredMB, wifiIn+cellIn)
+	}
+	if wifiIn < 65<<20 || cellIn < 10<<20 {
+		t.Fatalf("Fast Wi-Fi + Slow LTE 100MB split skewed: wifi=%d cell=%d", wifiIn, cellIn)
+	}
+	for i := 0; i < 5; i++ {
+		s.ReleaseFor(w, Fam4)
+	}
+	snap = s.Snapshot()
+	if snap[0].Active != 0 || snap[1].Active != 0 {
+		t.Fatalf("leaked active slots: %+v", snap)
+	}
+}
+
 // Unused sha256 guard to keep crypto/sha256 available if needed
 var _ = sha256.Size

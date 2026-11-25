@@ -76,6 +76,7 @@ type Slot struct {
 	ewmaIn, ewmaOut [2]float64 // EWMA smoothed throughput (bytes/s)
 	peak            [2]float64 // observed capacity: max recent rateIn+rateOut
 	peakUp          [2]float64 // Android port: the same, for upload (rateOut) alone
+	tcpDeficit       [2]float64 // smooth weighted round-robin deficit for TCP flows
 	udpDeficit       [2]float64 // smooth weighted round-robin deficit for UDP/QUIC
 
 	// The adapter's total traffic from the OS's counters (all apps, not only net-merge's flows).
@@ -157,6 +158,12 @@ func (s *Scheduler) SetMode(m Mode) {
 	s.mu.Unlock()
 }
 
+func (s *Scheduler) Mode() Mode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mode
+}
+
 func (s *Scheduler) ResetSession() {
 	s.mu.Lock()
 	for _, sl := range s.slots {
@@ -166,19 +173,17 @@ func (s *Scheduler) ResetSession() {
 		sl.rateLen = [2]int{}
 		sl.rateIn = [2]float64{}
 		sl.rateOut = [2]float64{}
+		sl.tcpDeficit = [2]float64{}
 		sl.udpDeficit = [2]float64{}
 	}
-	s.applyModeWeightsLocked(false)
+	s.applyModeWeightsLocked(true)
 	s.mu.Unlock()
 }
 
-func (s *Scheduler) applyModeWeightsLocked(resetMeasured bool) {
-	if resetMeasured {
+func (s *Scheduler) applyModeWeightsLocked(resetDeficits bool) {
+	if resetDeficits {
 		for _, sl := range s.slots {
-			sl.peak = [2]float64{}
-			sl.peakUp = [2]float64{}
-			sl.ewmaIn = [2]float64{}
-			sl.ewmaOut = [2]float64{}
+			sl.tcpDeficit = [2]float64{}
 			sl.udpDeficit = [2]float64{}
 			sl.downUntil = [2]time.Time{}
 		}
@@ -213,22 +218,51 @@ func (s *Scheduler) applyModeWeightsLocked(resetMeasured bool) {
 			}
 		}
 	case ModeTurboBoost, ModeSmartAdaptive:
-		if resetMeasured {
+		for _, f := range []Family{Fam4, Fam6} {
+			var maxUp, maxCap float64
+			live, measured := 0, true
 			for _, sl := range s.slots {
-				w := sl.base
-				if w <= 0 {
-					w = 1.0
+				if !sl.present || sl.ip(f) == nil {
+					continue
 				}
-				sl.weight = [2]float64{w, w}
+				live++
+				maxUp = math.Max(maxUp, sl.peakUp[f])
+				curCap := math.Max(sl.ewmaIn[f]+sl.ewmaOut[f], sl.peak[f])
+				maxCap = math.Max(maxCap, curCap)
+				if sl.peak[f] < minMeasuredPeak {
+					measured = false
+				}
+			}
+			upMeasured := maxUp > 0
+			for _, sl := range s.slots {
+				if sl.present && sl.ip(f) != nil && sl.peakUp[f] < minMeasuredPeak/2 {
+					upMeasured = false
+				}
+			}
+			for _, sl := range s.slots {
+				if !sl.present || sl.ip(f) == nil {
+					continue
+				}
+				switch {
+				case live < 2 || !measured:
+					w := sl.base
+					if w <= 0 {
+						w = 1.0
+					}
+					sl.weight[f] = w
+				case s.uploading && upMeasured:
+					sl.weight[f] = math.Max(0.05, sl.peakUp[f]/maxUp)
+				default:
+					cap := math.Max(sl.ewmaIn[f]+sl.ewmaOut[f], sl.peak[f])
+					if maxCap > 0 {
+						sl.weight[f] = math.Max(0.05, cap/maxCap)
+					} else {
+						sl.weight[f] = 1.0
+					}
+				}
 			}
 		}
 	}
-}
-
-func (s *Scheduler) Mode() Mode {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.mode
 }
 
 func normAddr(n nics.Nic) *slotAddr {
@@ -286,7 +320,12 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 			found.downUntil = [2]time.Time{}
 			found.rttMs[Fam4].Store(0)
 			found.rttMs[Fam6].Store(0)
+			found.tcpDeficit = [2]float64{}
 			found.udpDeficit = [2]float64{}
+			found.peak = [2]float64{}
+			found.peakUp = [2]float64{}
+			found.ewmaIn = [2]float64{}
+			found.ewmaOut = [2]float64{}
 			found.lastProbe = [2]time.Time{}
 			found.conns.Range(func(k, _ any) bool {
 				staleConns = append(staleConns, k.(io.Closer))
@@ -361,7 +400,7 @@ func (s *Scheduler) Tick(dt time.Duration) {
 
 	alpha := 1.0 - math.Exp(-sec/2.0)
 	ewmaDecay := math.Pow(0.90, sec)
-	peakDecay := math.Pow(0.97, sec)
+	peakDecay := math.Pow(0.985, sec)
 	idleGrow := math.Pow(1.03, sec)
 
 	var totIn, totOut float64
@@ -436,12 +475,16 @@ func (s *Scheduler) Tick(dt time.Duration) {
 			}
 
 			r := curIn + curOut
-			if r >= 0.05*sl.peak[f] {
+			if r >= sl.peak[f] {
+				sl.peak[f] = r
+			} else if r >= 0.25*sl.peak[f] {
 				sl.peak[f] = math.Max(r, sl.peak[f]*peakDecay)
-			} else {
+			} else if r < 0.05*sl.peak[f] {
 				idle[sl] = true
 			}
-			if curOut >= 0.05*sl.peakUp[f] {
+			if curOut >= sl.peakUp[f] {
+				sl.peakUp[f] = curOut
+			} else if curOut >= 0.25*sl.peakUp[f] {
 				sl.peakUp[f] = math.Max(curOut, sl.peakUp[f]*peakDecay)
 			}
 			if !sl.present || sl.ip(f) == nil {
@@ -517,11 +560,11 @@ func (s *Scheduler) Tick(dt time.Duration) {
 						sl.weight[f] = 1.0
 					}
 				case s.uploading && upMeasured:
-					sl.weight[f] = math.Max(0.15, sl.peakUp[f]/maxUp)
+					sl.weight[f] = math.Max(0.05, sl.peakUp[f]/maxUp)
 				default:
 					cap := math.Max(sl.ewmaIn[f]+sl.ewmaOut[f], sl.peak[f])
 					if maxCap > 0 {
-						sl.weight[f] = math.Max(0.15, cap/maxCap)
+						sl.weight[f] = math.Max(0.05, cap/maxCap)
 					} else {
 						sl.weight[f] = 1.0
 					}
@@ -666,22 +709,29 @@ func (s *Scheduler) AcquireForPort(f Family, port int, isUDP bool, skip map[stri
 		return best
 	}
 
-	// Dynamic proportional balancing for TCP flows with deterministic round-robin tie-breaking.
-	var best *Slot
-	bestScore := math.Inf(1)
-	for i := range pool {
-		sl := pool[(start+i)%len(pool)]
+	// Smooth Weighted Round-Robin (SWRR) for TCP flows: strictly proportional and immune
+	// to idle background keep-alive sockets sitting in actF.
+	var totalW float64
+	for _, sl := range pool {
 		w := sl.weight[f]
 		if w <= 0 {
 			w = 1.0
 		}
-		if (s.mode == ModeTurboBoost || s.mode == ModeSmartAdaptive) && sl.actF[f].Load() == 0 && sl.peak[f] < minMeasuredPeak {
+		if (s.mode == ModeTurboBoost || s.mode == ModeSmartAdaptive) && sl.peak[f] < minMeasuredPeak {
 			w = math.Max(w, 0.5)
 		}
-		if score := float64(sl.actF[f].Load()+1) / w; score < bestScore {
-			best, bestScore = sl, score
+		sl.tcpDeficit[f] += w
+		totalW += w
+	}
+	var best *Slot
+	bestDef := math.Inf(-1)
+	for i := range pool {
+		sl := pool[(start+i)%len(pool)]
+		if sl.tcpDeficit[f] > bestDef {
+			best, bestDef = sl, sl.tcpDeficit[f]
 		}
 	}
+	best.tcpDeficit[f] -= totalW
 	s.rrSeq++
 	best.active.Add(1)
 	best.actF[f].Add(1)

@@ -212,7 +212,7 @@ func TestAutoWeightsArePerFamily(t *testing.T) {
 		sb.bytesIn[Fam6].Add(100 * mbit)
 		s.Tick(time.Second)
 	}
-	if got := sb.weight[Fam4] / sa.weight[Fam4]; got > 0.16 {
+	if got := sb.weight[Fam4] / sa.weight[Fam4]; got > 0.06 {
 		t.Fatalf("slow v4 path should be down-weighted to ~0.05, got ratio %.2f", got)
 	}
 	if got := sb.weight[Fam6] / sa.weight[Fam6]; got < 0.95 {
@@ -238,7 +238,7 @@ func TestPessimisticEstimateRecoversWhileIdle(t *testing.T) {
 		sb.bytesIn[Fam4].Add(5 * mbit)
 		s.Tick(time.Second)
 	}
-	if w := sb.weight[Fam4] / sa.weight[Fam4]; w > 0.16 {
+	if w := sb.weight[Fam4] / sa.weight[Fam4]; w > 0.06 {
 		t.Fatalf("setup: B should be down-weighted, ratio %.2f", w)
 	}
 	for i := 0; i < 80; i++ { // then nobody uses B, and A keeps working
@@ -575,15 +575,69 @@ func TestDataSaverStrictBeforeFirstTickAndFailover(t *testing.T) {
 func TestModeSwitchResetsStaleWeights(t *testing.T) {
 	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "10.0.0.1", 1), nic("Mobile data", "10.0.0.2", 1)})
 	s.SetMode(ModeDataSaver)
-	w := s.slots[0]
+	w, c := s.slots[0], s.slots[1]
 	w.bytesIn[Fam4].Add(10 * 125_000)
 	s.Tick(time.Second)
 
+	// Cellular is unmeasured -> switching DataSaver -> TurboBoost resets weights to 1.0:1.0
 	s.SetMode(ModeTurboBoost)
 	for _, sl := range s.slots {
 		if sl.weight[Fam4] != 1.0 {
 			t.Fatalf("after switching to TurboBoost, %s weight=%v want 1.0", sl.Name, sl.weight[Fam4])
 		}
+	}
+
+	// Measure both links (1:4) and verify TurboBoost <-> SmartAdaptive preserves proportional weights
+	for i := 0; i < 3; i++ {
+		w.bytesIn[Fam4].Add(20 * 125_000)
+		c.bytesIn[Fam4].Add(80 * 125_000)
+		s.Tick(time.Second)
+	}
+	s.SetMode(ModeSmartAdaptive)
+	if r := w.weight[Fam4] / c.weight[Fam4]; r < 0.20 || r > 0.30 {
+		t.Fatalf("switching to SmartAdaptive lost measured ratio: got %.2f", r)
+	}
+}
+
+func TestIdleSocketsDoNotStarveOrSkewTCP(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "10.0.0.1", 1), nic("Mobile data", "10.0.0.2", 1)})
+	s.SetMode(ModeTurboBoost)
+	w, c := s.slots[0], s.slots[1]
+	for i := 0; i < 3; i++ {
+		w.bytesIn[Fam4].Add(20 * 125_000)
+		c.bytesIn[Fam4].Add(80 * 125_000)
+		s.Tick(time.Second)
+	}
+	// Simulate 5 idle background keep-alive sockets pinned on Wi-Fi
+	for i := 0; i < 5; i++ {
+		w.active.Add(1)
+		w.actF[Fam4].Add(1)
+	}
+	picks := acquireN(s, 40)
+	wifiCount := countBy(picks, "Wi-Fi")
+	cellCount := countBy(picks, "Mobile data")
+	if wifiCount < 6 || wifiCount > 10 || cellCount < 30 || cellCount > 34 {
+		t.Fatalf("idle sockets skewed SWRR split: want ~8/32, got wifi=%d cell=%d", wifiCount, cellCount)
+	}
+}
+
+func TestLightTrafficDoesNotCollapseMeasuredPeak(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "10.0.0.1", 1), nic("Mobile data", "10.0.0.2", 1)})
+	s.SetMode(ModeTurboBoost)
+	w, c := s.slots[0], s.slots[1]
+	const mbit = 125_000
+	for i := 0; i < 3; i++ {
+		w.bytesIn[Fam4].Add(100 * mbit)
+		c.bytesIn[Fam4].Add(20 * mbit)
+		s.Tick(time.Second)
+	}
+	// 30s of light 10 Mbps streaming on Wi-Fi (10% of 100 Mbps peak)
+	for i := 0; i < 30; i++ {
+		w.bytesIn[Fam4].Add(10 * mbit)
+		s.Tick(time.Second)
+	}
+	if w.peak[Fam4] < 90*mbit {
+		t.Fatalf("light streaming collapsed Wi-Fi peak: got %.0f", w.peak[Fam4])
 	}
 }
 
