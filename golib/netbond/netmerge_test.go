@@ -47,27 +47,17 @@ func TestSetAutoWeightsRestoresEvenSplit(t *testing.T) {
 	}
 }
 
-func TestSystemEstimateSeedsWeights(t *testing.T) {
+func TestUnmeasuredLinksStartBalanced(t *testing.T) {
 	SetAutoWeights(true)
 	if err := SetNetworks(`[{"name":"Wi-Fi","handle":"1","v4":true,"downKbps":400000},{"name":"Mobile data","handle":"2","v4":true,"downKbps":50000}]`); err != nil {
 		t.Fatal(err)
 	}
-	sched.Tick(time.Second) // nothing measured yet: weights come from the estimates
-	w := map[string]float64{}
+	sched.Tick(time.Second) // unmeasured links start 1.0:1.0 regardless of PHY downKbps
 	var st []stat
 	json.Unmarshal([]byte(Stats()), &st)
 	for _, s := range st {
-		w[s.Name] = s.Weight
-	}
-	if w["Wi-Fi"] != 1 || w["Mobile data"] != 0.125 {
-		t.Fatalf("weights %v, want Wi-Fi 1 and mobile 0.125", w)
-	}
-	SetAutoWeights(false) // even split ignores the estimates
-	defer SetAutoWeights(true)
-	json.Unmarshal([]byte(Stats()), &st)
-	for _, s := range st {
 		if s.Present && s.Weight != 1 {
-			t.Fatalf("even split: %s weight %v", s.Name, s.Weight)
+			t.Fatalf("unmeasured %s weight %v, want 1", s.Name, s.Weight)
 		}
 	}
 }

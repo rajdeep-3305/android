@@ -56,10 +56,6 @@ func SetNetworks(js string) error {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	var maxDown float64
-	for _, n := range in {
-		maxDown = max(maxDown, n.DownKbps)
-	}
 	list := make([]nics.Nic, 0, len(in))
 	for _, n := range in {
 		h, err := strconv.ParseUint(n.Handle, 10, 64)
@@ -75,9 +71,6 @@ func SetNetworks(js string) error {
 		w := n.Weight
 		if w <= 0 {
 			w = 1.0
-			if (currentMode == ModeTurboBoost || currentMode == ModeSmartAdaptive) && maxDown > 0 && n.DownKbps > 0 {
-				w = max(0.1, n.DownKbps/maxDown)
-			}
 		}
 		nic := nics.Nic{Name: n.Name, Index: idx, Weight: w}
 		if n.V4 {
@@ -131,6 +124,7 @@ func Start(fd int, mtu int) error {
 	if err := dev.Start(bal, fd, mtu); err != nil {
 		return err
 	}
+	sched.ResetSession()
 	stop = make(chan struct{})
 	go sched.RunProbes(stop)
 	go tick(stop)

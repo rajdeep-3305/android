@@ -81,7 +81,7 @@ func (c *slotPacketConn) WriteTo(p []byte, a net.Addr) (int, error) {
 // ListenUDP opens a UDP socket pinned to one NIC (a UDP "flow" = the socket, so every datagram
 // of that flow leaves the same way). UDP flows are short and numerous (DNS), so they don't hold
 // a balancing slot: the pick still spreads them via the scheduler's tie-breaking.
-func (b *Balancer) ListenUDP(ctx context.Context, f Family) (net.PacketConn, error) {
+func (b *Balancer) ListenUDP(ctx context.Context, f Family, port int) (net.PacketConn, error) {
 	network := "udp4"
 	if f == Fam6 {
 		network = "udp6"
@@ -89,7 +89,7 @@ func (b *Balancer) ListenUDP(ctx context.Context, f Family) (net.PacketConn, err
 	tried := map[string]struct{}{}
 	lastErr := errors.New("no usable network adapter")
 	for {
-		sl := b.S.AcquireForPort(f, 0, true, tried)
+		sl := b.S.AcquireForPort(f, port, true, tried)
 		if sl == nil {
 			return nil, lastErr
 		}

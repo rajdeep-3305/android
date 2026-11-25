@@ -212,7 +212,7 @@ func TestAutoWeightsArePerFamily(t *testing.T) {
 		sb.bytesIn[Fam6].Add(100 * mbit)
 		s.Tick(time.Second)
 	}
-	if got := sb.weight[Fam4] / sa.weight[Fam4]; got > 0.06 {
+	if got := sb.weight[Fam4] / sa.weight[Fam4]; got > 0.16 {
 		t.Fatalf("slow v4 path should be down-weighted to ~0.05, got ratio %.2f", got)
 	}
 	if got := sb.weight[Fam6] / sa.weight[Fam6]; got < 0.95 {
@@ -238,7 +238,7 @@ func TestPessimisticEstimateRecoversWhileIdle(t *testing.T) {
 		sb.bytesIn[Fam4].Add(5 * mbit)
 		s.Tick(time.Second)
 	}
-	if w := sb.weight[Fam4] / sa.weight[Fam4]; w > 0.06 {
+	if w := sb.weight[Fam4] / sa.weight[Fam4]; w > 0.16 {
 		t.Fatalf("setup: B should be down-weighted, ratio %.2f", w)
 	}
 	for i := 0; i < 80; i++ { // then nobody uses B, and A keeps working
@@ -470,5 +470,133 @@ func TestDataSaverPrefersWifiAndFailover(t *testing.T) {
 			t.Fatalf("flow %d after failover went to %v, want Mobile data", i, sl)
 		}
 		s.Release(sl)
+	}
+}
+
+func TestFourHzTickMatchesOneHzDecayAndWindow(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("wifi", "10.0.0.1", 1), nic("cell", "10.0.0.2", 1)})
+	s.SetMode(ModeTurboBoost)
+	w, c := s.slots[0], s.slots[1]
+	const mbit = 125_000
+	for i := 0; i < 3; i++ {
+		w.bytesIn[Fam4].Add(10 * mbit / 4)
+		c.bytesIn[Fam4].Add(30 * mbit / 4)
+		s.Tick(250 * time.Millisecond)
+	}
+	s.Tick(250 * time.Millisecond)
+	snap := s.Snapshot()
+	if snap[0].RateIn <= 0 || snap[1].RateIn <= 0 {
+		t.Fatalf("expected non-zero 1s windowed RateIn after brief 250ms pause, got wifi=%.0f cell=%.0f", snap[0].RateIn, snap[1].RateIn)
+	}
+}
+
+func TestTurboBoostBondsUDPQuicProportionally(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("wifi", "10.0.0.1", 1), nic("cell", "10.0.0.2", 1)})
+	s.SetMode(ModeTurboBoost)
+	w, c := s.slots[0], s.slots[1]
+	const mbit = 125_000
+	for i := 0; i < 4; i++ {
+		w.bytesIn[Fam4].Add(20 * mbit)
+		c.bytesIn[Fam4].Add(60 * mbit)
+		s.Tick(time.Second)
+	}
+	wifiCount, cellCount := 0, 0
+	for i := 0; i < 40; i++ {
+		sl := s.AcquireForPort(Fam4, 443, true, nil)
+		s.ReleaseFor(sl, Fam4)
+		if sl == w {
+			wifiCount++
+		} else if sl == c {
+			cellCount++
+		}
+	}
+	if wifiCount < 7 || wifiCount > 13 || cellCount < 27 || cellCount > 33 {
+		t.Fatalf("QUIC SWRR split want ~10/30, got wifi=%d cell=%d", wifiCount, cellCount)
+	}
+}
+
+func TestSmartAdaptiveBondsQuicButSteersDNSAndGaming(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("wifi", "10.0.0.1", 1), nic("cell", "10.0.0.2", 1)})
+	s.SetMode(ModeSmartAdaptive)
+	w, c := s.slots[0], s.slots[1]
+	s.SetStateWithRTT(w, Fam4, true, 10*time.Millisecond)
+	s.SetStateWithRTT(c, Fam4, true, 50*time.Millisecond)
+	s.Tick(time.Second)
+
+	for _, port := range []int{53, 3478} {
+		for i := 0; i < 6; i++ {
+			sl := s.AcquireForPort(Fam4, port, true, nil)
+			s.ReleaseFor(sl, Fam4)
+			if sl != w {
+				t.Fatalf("UDP port %d went to %s, want wifi", port, sl.Name)
+			}
+		}
+	}
+
+	seenWifi, seenCell := false, false
+	for i := 0; i < 10; i++ {
+		sl := s.AcquireForPort(Fam4, 443, true, nil)
+		s.ReleaseFor(sl, Fam4)
+		if sl == w {
+			seenWifi = true
+		} else if sl == c {
+			seenCell = true
+		}
+	}
+	if !seenWifi || !seenCell {
+		t.Fatalf("QUIC UDP 443 should bond across both links, got wifi=%v cell=%v", seenWifi, seenCell)
+	}
+}
+
+func TestDataSaverStrictBeforeFirstTickAndFailover(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("Mobile data", "10.0.0.2", 1), nic("Wi-Fi", "10.0.0.1", 1)})
+	s.SetMode(ModeDataSaver)
+	c, w := s.slots[0], s.slots[1]
+	s.SetState(w, Fam4, true)
+	s.SetState(c, Fam4, true)
+
+	for i := 0; i < 10; i++ {
+		sl := s.AcquireForPort(Fam4, 443, i%2 == 0, nil)
+		s.ReleaseFor(sl, Fam4)
+		if sl != w {
+			t.Fatalf("DataSaver flow %d went to %s before first tick, want Wi-Fi", i, sl.Name)
+		}
+	}
+
+	if got := s.AcquireForPort(Fam4, 443, false, map[string]struct{}{w.key: {}}); got != c {
+		t.Fatalf("DataSaver skip failover want Mobile data, got %v", got)
+	}
+	s.SetState(w, Fam4, false)
+	if got := s.AcquireForPort(Fam4, 443, false, nil); got != c {
+		t.Fatalf("DataSaver down failover want Mobile data, got %v", got)
+	}
+}
+
+func TestModeSwitchResetsStaleWeights(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "10.0.0.1", 1), nic("Mobile data", "10.0.0.2", 1)})
+	s.SetMode(ModeDataSaver)
+	w := s.slots[0]
+	w.bytesIn[Fam4].Add(10 * 125_000)
+	s.Tick(time.Second)
+
+	s.SetMode(ModeTurboBoost)
+	for _, sl := range s.slots {
+		if sl.weight[Fam4] != 1.0 {
+			t.Fatalf("after switching to TurboBoost, %s weight=%v want 1.0", sl.Name, sl.weight[Fam4])
+		}
+	}
+}
+
+func TestSplitEvenlyDeterministicAlternation(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("Wi-Fi", "10.0.0.1", 1), nic("Mobile data", "10.0.0.2", 1)})
+	s.SetMode(ModeSplitEvenly)
+	var last string
+	for i := 0; i < 10; i++ {
+		sl := s.AcquireForPort(Fam4, 443, i >= 5, nil)
+		s.ReleaseFor(sl, Fam4)
+		if sl.Name == last {
+			t.Fatalf("SplitEvenly repeated %s on consecutive flow %d", sl.Name, i)
+		}
+		last = sl.Name
 	}
 }

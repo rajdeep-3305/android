@@ -3,7 +3,6 @@ package engine
 import (
 	"io"
 	"math"
-	"math/rand/v2"
 	"net"
 	"strings"
 	"sync"
@@ -46,6 +45,8 @@ const (
 
 type slotAddr struct{ ip4, ip6 net.IP }
 
+type rateSample struct{ dt, in, out float64 }
+
 // Slot is a NIC plus its live counters. Counters are atomic so the data path never takes a lock.
 type Slot struct {
 	Name  string
@@ -67,10 +68,14 @@ type Slot struct {
 	lastProbe       [2]time.Time
 	downUntil       [2]time.Time
 	lastIn, lastOut [2]int64
-	rateIn, rateOut [2]float64 // bytes/s over the last tick
+	rateIn, rateOut [2]float64 // bytes/s over a 1-second sliding window
+	rateHist        [2][8]rateSample
+	rateIdx         [2]int
+	rateLen         [2]int
 	ewmaIn, ewmaOut [2]float64 // EWMA smoothed throughput (bytes/s)
 	peak            [2]float64 // observed capacity: max recent rateIn+rateOut
 	peakUp          [2]float64 // Android port: the same, for upload (rateOut) alone
+	udpDeficit       [2]float64 // smooth weighted round-robin deficit for UDP/QUIC
 
 	// The adapter's total traffic from the OS's counters (all apps, not only net-merge's flows).
 	linkIn, linkOut         uint64
@@ -122,6 +127,7 @@ type Scheduler struct {
 	mode      Mode
 	now       func() time.Time
 	uploading bool
+	rrSeq     uint64
 }
 
 func NewScheduler(nics []nics.Nic) *Scheduler {
@@ -132,18 +138,90 @@ func NewScheduler(nics []nics.Nic) *Scheduler {
 
 func (s *Scheduler) SetAuto(on bool) {
 	s.mu.Lock()
+	m := ModeSplitEvenly
 	if on {
-		s.mode = ModeTurboBoost
-	} else {
-		s.mode = ModeSplitEvenly
+		m = ModeTurboBoost
 	}
+	changed := s.mode != m
+	s.mode = m
+	s.applyModeWeightsLocked(changed)
 	s.mu.Unlock()
 }
 
 func (s *Scheduler) SetMode(m Mode) {
 	s.mu.Lock()
+	changed := s.mode != m
 	s.mode = m
+	s.applyModeWeightsLocked(changed)
 	s.mu.Unlock()
+}
+
+func (s *Scheduler) ResetSession() {
+	s.mu.Lock()
+	for _, sl := range s.slots {
+		sl.downUntil = [2]time.Time{}
+		sl.rateHist = [2][8]rateSample{}
+		sl.rateIdx = [2]int{}
+		sl.rateLen = [2]int{}
+		sl.rateIn = [2]float64{}
+		sl.rateOut = [2]float64{}
+		sl.udpDeficit = [2]float64{}
+	}
+	s.applyModeWeightsLocked(false)
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) applyModeWeightsLocked(resetMeasured bool) {
+	if resetMeasured {
+		for _, sl := range s.slots {
+			sl.peak = [2]float64{}
+			sl.peakUp = [2]float64{}
+			sl.ewmaIn = [2]float64{}
+			sl.ewmaOut = [2]float64{}
+			sl.udpDeficit = [2]float64{}
+			sl.downUntil = [2]time.Time{}
+		}
+	}
+	switch s.mode {
+	case ModeSplitEvenly:
+		for _, sl := range s.slots {
+			sl.weight = [2]float64{1.0, 1.0}
+		}
+	case ModeDataSaver:
+		for _, f := range []Family{Fam4, Fam6} {
+			var hasUpWifi bool
+			for _, sl := range s.slots {
+				if sl.present && sl.ip(f) != nil && sl.isWifi() && sl.state[f] != stateDown {
+					hasUpWifi = true
+					break
+				}
+			}
+			for _, sl := range s.slots {
+				if !sl.present || sl.ip(f) == nil {
+					continue
+				}
+				if hasUpWifi {
+					if sl.isWifi() {
+						sl.weight[f] = 1.0
+					} else {
+						sl.weight[f] = 0.01
+					}
+				} else {
+					sl.weight[f] = 1.0
+				}
+			}
+		}
+	case ModeTurboBoost, ModeSmartAdaptive:
+		if resetMeasured {
+			for _, sl := range s.slots {
+				w := sl.base
+				if w <= 0 {
+					w = 1.0
+				}
+				sl.weight = [2]float64{w, w}
+			}
+		}
+	}
 }
 
 func (s *Scheduler) Mode() Mode {
@@ -218,6 +296,7 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 		}
 	}
 	s.slots = kept
+	s.applyModeWeightsLocked(false)
 }
 
 const minMeasuredPeak = 50_000 // bytes/s (0.4 Mbit/s)
@@ -257,13 +336,47 @@ func (s *Scheduler) Tick(dt time.Duration) {
 		sl.linkIn, sl.linkOut, sl.linkPrimed = in, out, true
 	}
 
+	alpha := 1.0 - math.Exp(-sec/2.0)
+	ewmaDecay := math.Pow(0.90, sec)
+	peakDecay := math.Pow(0.97, sec)
+	idleGrow := math.Pow(1.03, sec)
+
 	var totIn, totOut float64
-	for _, sl := range s.slots {
-		for _, f := range []Family{Fam4, Fam6} {
-			totIn += float64(sl.bytesIn[f].Load()-sl.lastIn[f]) / sec
-			totOut += float64(sl.bytesOut[f].Load()-sl.lastOut[f]) / sec
+	for _, f := range []Family{Fam4, Fam6} {
+		for _, sl := range s.slots {
+			in, out := sl.bytesIn[f].Load(), sl.bytesOut[f].Load()
+			dIn := float64(in - sl.lastIn[f])
+			dOut := float64(out - sl.lastOut[f])
+			sl.lastIn[f], sl.lastOut[f] = in, out
+
+			idx := sl.rateIdx[f]
+			sl.rateHist[f][idx] = rateSample{dt: sec, in: dIn, out: dOut}
+			sl.rateIdx[f] = (idx + 1) % len(sl.rateHist[f])
+			if sl.rateLen[f] < len(sl.rateHist[f]) {
+				sl.rateLen[f]++
+			}
+
+			var winSec, winIn, winOut float64
+			for k := 0; k < sl.rateLen[f]; k++ {
+				pos := (idx - k + len(sl.rateHist[f])) % len(sl.rateHist[f])
+				rs := sl.rateHist[f][pos]
+				winSec += rs.dt
+				winIn += rs.in
+				winOut += rs.out
+				if winSec >= 0.99 {
+					break
+				}
+			}
+			if winSec <= 0 {
+				winSec = sec
+			}
+			sl.rateIn[f] = winIn / winSec
+			sl.rateOut[f] = winOut / winSec
+			totIn += sl.rateIn[f]
+			totOut += sl.rateOut[f]
 		}
 	}
+
 	switch {
 	case totOut > minMeasuredPeak && totOut > 1.5*totIn:
 		s.uploading = true
@@ -276,42 +389,37 @@ func (s *Scheduler) Tick(dt time.Duration) {
 		live, measured := 0, true
 		idle := map[*Slot]bool{}
 		for _, sl := range s.slots {
-			in, out := sl.bytesIn[f].Load(), sl.bytesOut[f].Load()
-			instantIn := float64(in-sl.lastIn[f]) / sec
-			instantOut := float64(out-sl.lastOut[f]) / sec
-			sl.rateIn[f] = instantIn
-			sl.rateOut[f] = instantOut
-			sl.lastIn[f], sl.lastOut[f] = in, out
+			curIn := sl.rateIn[f]
+			curOut := sl.rateOut[f]
 
-			// EWMA calculation: rapid tracking (alpha = 0.35)
-			if instantIn > 0 {
+			if curIn > 0 {
 				if sl.ewmaIn[f] <= 0 {
-					sl.ewmaIn[f] = instantIn
+					sl.ewmaIn[f] = curIn
 				} else {
-					sl.ewmaIn[f] = 0.35*instantIn + 0.65*sl.ewmaIn[f]
+					sl.ewmaIn[f] = alpha*curIn + (1.0-alpha)*sl.ewmaIn[f]
 				}
 			} else {
-				sl.ewmaIn[f] *= 0.96
+				sl.ewmaIn[f] *= ewmaDecay
 			}
 
-			if instantOut > 0 {
+			if curOut > 0 {
 				if sl.ewmaOut[f] <= 0 {
-					sl.ewmaOut[f] = instantOut
+					sl.ewmaOut[f] = curOut
 				} else {
-					sl.ewmaOut[f] = 0.35*instantOut + 0.65*sl.ewmaOut[f]
+					sl.ewmaOut[f] = alpha*curOut + (1.0-alpha)*sl.ewmaOut[f]
 				}
 			} else {
-				sl.ewmaOut[f] *= 0.96
+				sl.ewmaOut[f] *= ewmaDecay
 			}
 
-			r := instantIn + instantOut
+			r := curIn + curOut
 			if r >= 0.05*sl.peak[f] {
-				sl.peak[f] = math.Max(r, sl.peak[f]*0.97)
+				sl.peak[f] = math.Max(r, sl.peak[f]*peakDecay)
 			} else {
 				idle[sl] = true
 			}
-			if instantOut >= 0.05*sl.peakUp[f] {
-				sl.peakUp[f] = math.Max(instantOut, sl.peakUp[f]*0.97)
+			if curOut >= 0.05*sl.peakUp[f] {
+				sl.peakUp[f] = math.Max(curOut, sl.peakUp[f]*peakDecay)
 			}
 			if !sl.present || sl.ip(f) == nil {
 				continue
@@ -325,12 +433,12 @@ func (s *Scheduler) Tick(dt time.Duration) {
 
 		for _, sl := range s.slots {
 			if sl.present && sl.ip(f) != nil && sl.peakUp[f] > 0 && sl.rateOut[f] < 0.05*sl.peakUp[f] {
-				sl.peakUp[f] = math.Min(sl.peakUp[f]*1.03, math.Max(sl.peakUp[f], 0.5*maxUp))
+				sl.peakUp[f] = math.Min(sl.peakUp[f]*idleGrow, math.Max(sl.peakUp[f], 0.5*maxUp))
 			}
 		}
 		for sl := range idle {
 			if sl.present && sl.ip(f) != nil && sl.peak[f] > 0 {
-				sl.peak[f] = math.Min(sl.peak[f]*1.03, math.Max(sl.peak[f], 0.5*maxPeak))
+				sl.peak[f] = math.Min(sl.peak[f]*idleGrow, math.Max(sl.peak[f], 0.5*maxPeak))
 			}
 		}
 		for _, sl := range s.slots {
@@ -345,7 +453,6 @@ func (s *Scheduler) Tick(dt time.Duration) {
 			}
 		}
 
-		// Apply weights based on mode
 		switch s.mode {
 		case ModeSplitEvenly:
 			for _, sl := range s.slots {
@@ -366,12 +473,12 @@ func (s *Scheduler) Tick(dt time.Duration) {
 				}
 				if hasUpWifi {
 					if sl.isWifi() {
-						sl.weight[f] = 10.0
+						sl.weight[f] = 1.0
 					} else {
-						sl.weight[f] = 0.02 // keep cellular standby
+						sl.weight[f] = 0.01
 					}
 				} else {
-					sl.weight[f] = 1.0 // failover
+					sl.weight[f] = 1.0
 				}
 			}
 
@@ -387,11 +494,11 @@ func (s *Scheduler) Tick(dt time.Duration) {
 						sl.weight[f] = 1.0
 					}
 				case s.uploading && upMeasured:
-					sl.weight[f] = math.Max(0.05, sl.peakUp[f]/maxUp)
+					sl.weight[f] = math.Max(0.15, sl.peakUp[f]/maxUp)
 				default:
 					cap := math.Max(sl.ewmaIn[f]+sl.ewmaOut[f], sl.peak[f])
 					if maxCap > 0 {
-						sl.weight[f] = math.Max(0.05, cap/maxCap)
+						sl.weight[f] = math.Max(0.15, cap/maxCap)
 					} else {
 						sl.weight[f] = 1.0
 					}
@@ -404,7 +511,8 @@ func (s *Scheduler) Tick(dt time.Duration) {
 // IsLatencySensitive checks if a flow is interactive or latency-critical (DNS, VoIP, Gaming, SSH).
 func IsLatencySensitive(port int, isUDP bool) bool {
 	if isUDP {
-		return true // Gaming, DNS, VoIP (WebRTC), QUIC
+		// Bulk HTTP/3 (QUIC) on 443/80 should bond proportionally; DNS/VoIP/gaming/STUN pin to lowest RTT.
+		return port != 443 && port != 80
 	}
 	switch port {
 	case 53, 853: // DNS, DoT
@@ -464,12 +572,32 @@ func (s *Scheduler) AcquireForPort(f Family, port int, isUDP bool, skip map[stri
 		return nil
 	}
 
+	// Strict Data Saver: stay on Wi-Fi whenever a healthy Wi-Fi link is in the active pool.
+	if s.mode == ModeDataSaver && len(pool) > 1 {
+		var wifiPool []*Slot
+		for _, sl := range pool {
+			if sl.isWifi() {
+				wifiPool = append(wifiPool, sl)
+			}
+		}
+		if len(wifiPool) > 0 {
+			pool = wifiPool
+		}
+	}
+
 	// QoS optimization for Smart Adaptive mode: steer latency-sensitive traffic to lowest RTT
 	if s.mode == ModeSmartAdaptive && IsLatencySensitive(port, isUDP) && len(pool) > 1 {
+		otherFam := Fam6
+		if f == Fam6 {
+			otherFam = Fam4
+		}
 		var bestRTT *Slot
 		lowestRTT := int64(math.MaxInt64)
 		for _, sl := range pool {
 			rtt := sl.rttMs[f].Load()
+			if rtt <= 0 {
+				rtt = sl.rttMs[otherFam].Load()
+			}
 			if rtt > 0 && rtt < lowestRTT {
 				lowestRTT = rtt
 				bestRTT = sl
@@ -483,8 +611,39 @@ func (s *Scheduler) AcquireForPort(f Family, port int, isUDP bool, skip map[stri
 		}
 	}
 
-	// Dynamic proportional balancing (Turbo Boost, Data Saver, Split Evenly, or bulk in Adaptive)
-	start := rand.IntN(len(pool))
+	start := int(s.rrSeq % uint64(len(pool)))
+
+	// Smooth Weighted Round-Robin (SWRR) for UDP/QUIC flows so HTTP/3 bonds proportionally.
+	if isUDP {
+		var totalW float64
+		for _, sl := range pool {
+			w := sl.weight[f]
+			if w <= 0 {
+				w = 1.0
+			}
+			if (s.mode == ModeTurboBoost || s.mode == ModeSmartAdaptive) && sl.peak[f] < minMeasuredPeak {
+				w = math.Max(w, 0.5)
+			}
+			sl.udpDeficit[f] += w
+			totalW += w
+		}
+		var best *Slot
+		bestDef := math.Inf(-1)
+		for i := range pool {
+			sl := pool[(start+i)%len(pool)]
+			if sl.udpDeficit[f] > bestDef {
+				best, bestDef = sl, sl.udpDeficit[f]
+			}
+		}
+		best.udpDeficit[f] -= totalW
+		s.rrSeq++
+		best.active.Add(1)
+		best.actF[f].Add(1)
+		best.total.Add(1)
+		return best
+	}
+
+	// Dynamic proportional balancing for TCP flows with deterministic round-robin tie-breaking.
 	var best *Slot
 	bestScore := math.Inf(1)
 	for i := range pool {
@@ -493,8 +652,6 @@ func (s *Scheduler) AcquireForPort(f Family, port int, isUDP bool, skip map[stri
 		if w <= 0 {
 			w = 1.0
 		}
-		// Exploratory boost for unmeasured links: if an interface is completely idle and unmeasured,
-		// don't let it starve on low base weight; give it an exploratory chance to carry a flow!
 		if (s.mode == ModeTurboBoost || s.mode == ModeSmartAdaptive) && sl.actF[f].Load() == 0 && sl.peak[f] < minMeasuredPeak {
 			w = math.Max(w, 0.5)
 		}
@@ -502,6 +659,7 @@ func (s *Scheduler) AcquireForPort(f Family, port int, isUDP bool, skip map[stri
 			best, bestScore = sl, score
 		}
 	}
+	s.rrSeq++
 	best.active.Add(1)
 	best.actF[f].Add(1)
 	best.total.Add(1)
